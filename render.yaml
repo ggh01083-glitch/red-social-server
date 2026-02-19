@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: red-social-server
+    env: node
+    buildCommand: npm install
+    startCommand: node index.js
+    plan: free
+    envVars:
+      - key: SUPABASE_URL
+        value: https://axlwyiweduzgbplfhghl.supabase.co
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        value: dwiurpjqn
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: PORT
+        value: 3000
