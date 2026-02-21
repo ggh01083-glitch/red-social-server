@@ -6,7 +6,7 @@ const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.set('trust proxy', 1);
+app.set('trust proxy', 1); // requerido para que rate limiter funcione en Render
 const PORT = process.env.PORT || 3000;
 
 const supabase = createClient(
