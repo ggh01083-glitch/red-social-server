@@ -187,9 +187,9 @@ app.get('/api/profiles/:username', requireAuth, async (req, res) => {
   else if (receivedRow.data?.status === 'pending')
     friendStatus = 'pending_received';
 
-  // Videos subidos
+  // Videos subidos (busca por uploaded_by O por el username en profiles join)
   const { data: videos } = await supabase.from('videos')
-    .select('id, cloudinary_url, title, created_at')
+    .select('id, cloudinary_url, title, created_at, uploaded_by')
     .eq('uploaded_by', profile.id)
     .order('created_at', { ascending: false });
 
@@ -549,10 +549,14 @@ app.post('/api/friends/request', requireAuth, async (req, res) => {
   if (!addressee) return res.status(404).json({ error: 'Usuario no encontrado' });
   if (addressee.id === userId) return res.status(400).json({ error: 'No puedes seguirte a ti mismo' });
 
-  // Verificar si ya existe
-  const { data: existing } = await supabase.from('friendships').select('id, status')
-    .or(`and(requester_id.eq.${userId},addressee_id.eq.${addressee.id}),and(requester_id.eq.${addressee.id},addressee_id.eq.${userId})`)
-    .maybeSingle();
+  // Verificar si ya existe (dos queries simples evitan el bug de .or anidado)
+  const [{ data: ex1 }, { data: ex2 }] = await Promise.all([
+    supabase.from('friendships').select('id, status')
+      .eq('requester_id', userId).eq('addressee_id', addressee.id).maybeSingle(),
+    supabase.from('friendships').select('id, status')
+      .eq('requester_id', addressee.id).eq('addressee_id', userId).maybeSingle(),
+  ]);
+  const existing = ex1 ?? ex2;
   if (existing) {
     if (existing.status === 'accepted') return res.status(409).json({ error: 'Ya son amigos' });
     return res.status(409).json({ error: 'Solicitud ya enviada' });
@@ -588,8 +592,10 @@ app.post('/api/friends/respond', requireAuth, async (req, res) => {
 app.delete('/api/friends/:friendId', requireAuth, async (req, res) => {
   const { friendId } = req.params;
   const userId = req.userId;
-  await supabase.from('friendships').delete()
-    .or(`and(requester_id.eq.${userId},addressee_id.eq.${friendId}),and(requester_id.eq.${friendId},addressee_id.eq.${userId})`);
+  await Promise.all([
+    supabase.from('friendships').delete().eq('requester_id', userId).eq('addressee_id', friendId),
+    supabase.from('friendships').delete().eq('requester_id', friendId).eq('addressee_id', userId),
+  ]);
   res.json({ ok: true });
 });
 
@@ -602,14 +608,16 @@ app.get('/api/messages/:userId', requireAuth, async (req, res) => {
   const myId = req.userId;
 
   // Verificar que son amigos
-  const { data: friendship } = await supabase.from('friendships').select('id, status')
-    .or(`and(requester_id.eq.${myId},addressee_id.eq.${otherId}),and(requester_id.eq.${otherId},addressee_id.eq.${myId})`)
-    .eq('status', 'accepted').maybeSingle();
-  if (!friendship) return res.status(403).json({ error: 'Solo puedes chatear con amigos' });
+  const [{ data: fs1 }, { data: fs2 }] = await Promise.all([
+    supabase.from('friendships').select('id').eq('requester_id', myId).eq('addressee_id', otherId).eq('status', 'accepted').maybeSingle(),
+    supabase.from('friendships').select('id').eq('requester_id', otherId).eq('addressee_id', myId).eq('status', 'accepted').maybeSingle(),
+  ]);
+  if (!fs1 && !fs2) return res.status(403).json({ error: 'Solo puedes chatear con amigos' });
 
   const { data: messages, error } = await supabase.from('messages')
     .select('id, sender_id, receiver_id, text, read, created_at')
-    .or(`and(sender_id.eq.${myId},receiver_id.eq.${otherId}),and(sender_id.eq.${otherId},receiver_id.eq.${myId})`)
+    .in('sender_id', [myId, otherId])
+    .in('receiver_id', [myId, otherId])
     .order('created_at', { ascending: true })
     .limit(100);
   if (error) return res.status(500).json({ error: error.message });
@@ -629,10 +637,11 @@ app.post('/api/messages', requireAuth, async (req, res) => {
   if (text.length > 1000) return res.status(400).json({ error: 'Máximo 1000 caracteres' });
 
   // Verificar amistad
-  const { data: friendship } = await supabase.from('friendships').select('id')
-    .or(`and(requester_id.eq.${senderId},addressee_id.eq.${receiver_id}),and(requester_id.eq.${receiver_id},addressee_id.eq.${senderId})`)
-    .eq('status', 'accepted').maybeSingle();
-  if (!friendship) return res.status(403).json({ error: 'Solo puedes enviar mensajes a amigos' });
+  const [{ data: sf1 }, { data: sf2 }] = await Promise.all([
+    supabase.from('friendships').select('id').eq('requester_id', senderId).eq('addressee_id', receiver_id).eq('status', 'accepted').maybeSingle(),
+    supabase.from('friendships').select('id').eq('requester_id', receiver_id).eq('addressee_id', senderId).eq('status', 'accepted').maybeSingle(),
+  ]);
+  if (!sf1 && !sf2) return res.status(403).json({ error: 'Solo puedes enviar mensajes a amigos' });
 
   const { data, error } = await supabase.from('messages')
     .insert({ sender_id: senderId, receiver_id, text: text.trim() })
