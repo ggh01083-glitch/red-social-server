@@ -171,21 +171,14 @@ app.get('/api/profiles/:username', requireAuth, async (req, res) => {
     .eq('username', username).single();
   if (error || !profile) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-  // Friendship status
-  const [sentRow, receivedRow] = await Promise.all([
-    supabase.from('friendships').select('id, status')
-      .eq('requester_id', userId).eq('addressee_id', profile.id).maybeSingle(),
-    supabase.from('friendships').select('id, status')
-      .eq('requester_id', profile.id).eq('addressee_id', userId).maybeSingle(),
+  // Follow status (following = yo sigo a él, follower = él me sigue, friends = mutual)
+  const [iFollow, theyFollow] = await Promise.all([
+    supabase.from('friendships').select('id').eq('requester_id', userId).eq('addressee_id', profile.id).maybeSingle(),
+    supabase.from('friendships').select('id').eq('requester_id', profile.id).eq('addressee_id', userId).maybeSingle(),
   ]);
-
-  let friendStatus = 'none'; // none | pending_sent | pending_received | friends
-  if (sentRow.data?.status === 'accepted' || receivedRow.data?.status === 'accepted')
-    friendStatus = 'friends';
-  else if (sentRow.data?.status === 'pending')
-    friendStatus = 'pending_sent';
-  else if (receivedRow.data?.status === 'pending')
-    friendStatus = 'pending_received';
+  let friendStatus = 'none'; // none | following | friends
+  if (iFollow.data && theyFollow.data) friendStatus = 'friends';
+  else if (iFollow.data) friendStatus = 'following';
 
   // Videos subidos (busca por uploaded_by O por el username en profiles join)
   const { data: videos } = await supabase.from('videos')
@@ -490,113 +483,77 @@ app.post('/api/notifications/read', requireAuth, async (req, res) => {
 // AMIGOS / SEGUIR
 // ══════════════════════════════════════════════════════════════
 
+// GET /api/friends → amigos mutuos (ambos se siguen)
 app.get('/api/friends', requireAuth, async (req, res) => {
   const userId = req.userId;
 
-  // Amigos aceptados (en cualquier dirección)
-  const [sent, received] = await Promise.all([
-    supabase.from('friendships')
-      .select('id, status, created_at, addressee_id, profiles!friendships_addressee_id_fkey(username, avatar_url)')
-      .eq('requester_id', userId),
-    supabase.from('friendships')
-      .select('id, status, created_at, requester_id, profiles!friendships_requester_id_fkey(username, avatar_url)')
-      .eq('addressee_id', userId),
-  ]);
+  // Todos a quienes sigo
+  const { data: following } = await supabase.from('friendships')
+    .select('addressee_id, profiles!friendships_addressee_id_fkey(username, avatar_url)')
+    .eq('requester_id', userId);
 
-  const friends = [];
-  const pending_received = [];
-  const pending_sent = [];
+  // Todos los que me siguen a mí
+  const { data: followers } = await supabase.from('friendships')
+    .select('requester_id')
+    .eq('addressee_id', userId);
 
-  for (const f of sent.data ?? []) {
-    const p = f.profiles;
-    if (f.status === 'accepted')
-      friends.push({ id: f.addressee_id, username: p?.username, avatar_url: p?.avatar_url, friendship_id: f.id });
-    else
-      pending_sent.push({ id: f.addressee_id, username: p?.username, avatar_url: p?.avatar_url, friendship_id: f.id });
-  }
-  for (const f of received.data ?? []) {
-    const p = f.profiles;
-    if (f.status === 'accepted')
-      friends.push({ id: f.requester_id, username: p?.username, avatar_url: p?.avatar_url, friendship_id: f.id });
-    else
-      pending_received.push({ id: f.requester_id, username: p?.username, avatar_url: p?.avatar_url, friendship_id: f.id });
-  }
+  const followerSet = new Set((followers ?? []).map(f => f.requester_id));
 
-  // Mensajes no leídos por amigo
-  const unreadMsgs = await supabase.from('messages')
-    .select('sender_id', { count: 'exact' })
-    .eq('receiver_id', userId).eq('read', false);
+  // Amigos = los que sigo Y me siguen (mutual)
+  const friends = (following ?? [])
+    .filter(f => followerSet.has(f.addressee_id))
+    .map(f => ({
+      id: f.addressee_id,
+      username: f.profiles?.username,
+      avatar_url: f.profiles?.avatar_url,
+    }));
 
+  // Mensajes no leídos
+  const { data: unreadMsgs } = await supabase.from('messages')
+    .select('sender_id').eq('receiver_id', userId).eq('read', false);
   const unreadByUser = {};
-  for (const m of unreadMsgs.data ?? []) {
+  for (const m of unreadMsgs ?? []) {
     unreadByUser[m.sender_id] = (unreadByUser[m.sender_id] ?? 0) + 1;
   }
 
-  const enrichedFriends = friends.map(f => ({
-    ...f, unread_messages: unreadByUser[f.id] ?? 0,
-  }));
-
-  res.json({ friends: enrichedFriends, pending_received, pending_sent });
+  const enriched = friends.map(f => ({ ...f, unread_messages: unreadByUser[f.id] ?? 0 }));
+  res.json({ friends: enriched });
 });
 
-app.post('/api/friends/request', requireAuth, async (req, res) => {
-  const { addressee_username } = req.body;
+// POST /api/follow → seguir a alguien (inmediato, sin aprobación)
+app.post('/api/follow', requireAuth, async (req, res) => {
+  const { username } = req.body;
   const userId = req.userId;
-  if (!addressee_username) return res.status(400).json({ error: 'addressee_username requerido' });
+  if (!username) return res.status(400).json({ error: 'username requerido' });
 
-  const { data: addressee } = await supabase.from('profiles')
-    .select('id').eq('username', addressee_username).single();
-  if (!addressee) return res.status(404).json({ error: 'Usuario no encontrado' });
-  if (addressee.id === userId) return res.status(400).json({ error: 'No puedes seguirte a ti mismo' });
+  const { data: target } = await supabase.from('profiles').select('id').eq('username', username).single();
+  if (!target) return res.status(404).json({ error: 'Usuario no encontrado' });
+  if (target.id === userId) return res.status(400).json({ error: 'No puedes seguirte a ti mismo' });
 
-  // Verificar si ya existe (dos queries simples evitan el bug de .or anidado)
-  const [{ data: ex1 }, { data: ex2 }] = await Promise.all([
-    supabase.from('friendships').select('id, status')
-      .eq('requester_id', userId).eq('addressee_id', addressee.id).maybeSingle(),
-    supabase.from('friendships').select('id, status')
-      .eq('requester_id', addressee.id).eq('addressee_id', userId).maybeSingle(),
-  ]);
-  const existing = ex1 ?? ex2;
-  if (existing) {
-    if (existing.status === 'accepted') return res.status(409).json({ error: 'Ya son amigos' });
-    return res.status(409).json({ error: 'Solicitud ya enviada' });
-  }
+  // Si ya lo sigo, no hacer nada
+  const { data: existing } = await supabase.from('friendships').select('id')
+    .eq('requester_id', userId).eq('addressee_id', target.id).maybeSingle();
+  if (existing) return res.json({ ok: true, status: 'following' });
 
-  await supabase.from('friendships').insert({ requester_id: userId, addressee_id: addressee.id });
-  await createNotif(addressee.id, userId, 'friend_request', userId);
-  res.json({ ok: true, status: 'pending_sent' });
+  await supabase.from('friendships').insert({ requester_id: userId, addressee_id: target.id, status: 'following' });
+
+  // Notificar al seguido
+  await createNotif(target.id, userId, 'followed_you', userId);
+
+  // Comprobar si ahora son mutuos (friends)
+  const { data: theyFollow } = await supabase.from('friendships').select('id')
+    .eq('requester_id', target.id).eq('addressee_id', userId).maybeSingle();
+  const isFriend = !!theyFollow;
+
+  res.json({ ok: true, status: isFriend ? 'friends' : 'following' });
 });
 
-app.post('/api/friends/respond', requireAuth, async (req, res) => {
-  const { friendship_id, accept } = req.body;
+// DELETE /api/follow/:userId → dejar de seguir
+app.delete('/api/follow/:targetId', requireAuth, async (req, res) => {
+  const { targetId } = req.params;
   const userId = req.userId;
-  if (!friendship_id || accept === undefined)
-    return res.status(400).json({ error: 'friendship_id y accept requeridos' });
-
-  const { data: friendship } = await supabase.from('friendships')
-    .select('id, requester_id, addressee_id, status').eq('id', friendship_id).single();
-  if (!friendship) return res.status(404).json({ error: 'Solicitud no encontrada' });
-  if (friendship.addressee_id !== userId) return res.status(403).json({ error: 'No es tu solicitud' });
-  if (friendship.status !== 'pending') return res.status(400).json({ error: 'Solicitud ya procesada' });
-
-  if (accept) {
-    await supabase.from('friendships').update({ status: 'accepted' }).eq('id', friendship_id);
-    await createNotif(friendship.requester_id, userId, 'friend_accepted', userId);
-    res.json({ ok: true, status: 'friends' });
-  } else {
-    await supabase.from('friendships').delete().eq('id', friendship_id);
-    res.json({ ok: true, status: 'rejected' });
-  }
-});
-
-app.delete('/api/friends/:friendId', requireAuth, async (req, res) => {
-  const { friendId } = req.params;
-  const userId = req.userId;
-  await Promise.all([
-    supabase.from('friendships').delete().eq('requester_id', userId).eq('addressee_id', friendId),
-    supabase.from('friendships').delete().eq('requester_id', friendId).eq('addressee_id', userId),
-  ]);
-  res.json({ ok: true });
+  await supabase.from('friendships').delete().eq('requester_id', userId).eq('addressee_id', targetId);
+  res.json({ ok: true, status: 'none' });
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -608,11 +565,12 @@ app.get('/api/messages/:userId', requireAuth, async (req, res) => {
   const myId = req.userId;
 
   // Verificar que son amigos
-  const [{ data: fs1 }, { data: fs2 }] = await Promise.all([
-    supabase.from('friendships').select('id').eq('requester_id', myId).eq('addressee_id', otherId).eq('status', 'accepted').maybeSingle(),
-    supabase.from('friendships').select('id').eq('requester_id', otherId).eq('addressee_id', myId).eq('status', 'accepted').maybeSingle(),
+  // Solo pueden chatear si el follow es mutuo
+  const [{ data: iFollow }, { data: theyFollow }] = await Promise.all([
+    supabase.from('friendships').select('id').eq('requester_id', myId).eq('addressee_id', otherId).maybeSingle(),
+    supabase.from('friendships').select('id').eq('requester_id', otherId).eq('addressee_id', myId).maybeSingle(),
   ]);
-  if (!fs1 && !fs2) return res.status(403).json({ error: 'Solo puedes chatear con amigos' });
+  if (!iFollow || !theyFollow) return res.status(403).json({ error: 'Solo puedes chatear con amigos mutuos' });
 
   const { data: messages, error } = await supabase.from('messages')
     .select('id, sender_id, receiver_id, text, read, created_at')
@@ -638,10 +596,10 @@ app.post('/api/messages', requireAuth, async (req, res) => {
 
   // Verificar amistad
   const [{ data: sf1 }, { data: sf2 }] = await Promise.all([
-    supabase.from('friendships').select('id').eq('requester_id', senderId).eq('addressee_id', receiver_id).eq('status', 'accepted').maybeSingle(),
-    supabase.from('friendships').select('id').eq('requester_id', receiver_id).eq('addressee_id', senderId).eq('status', 'accepted').maybeSingle(),
+    supabase.from('friendships').select('id').eq('requester_id', senderId).eq('addressee_id', receiver_id).maybeSingle(),
+    supabase.from('friendships').select('id').eq('requester_id', receiver_id).eq('addressee_id', senderId).maybeSingle(),
   ]);
-  if (!sf1 && !sf2) return res.status(403).json({ error: 'Solo puedes enviar mensajes a amigos' });
+  if (!sf1 || !sf2) return res.status(403).json({ error: 'Solo puedes enviar mensajes a amigos mutuos' });
 
   const { data, error } = await supabase.from('messages')
     .insert({ sender_id: senderId, receiver_id, text: text.trim() })
