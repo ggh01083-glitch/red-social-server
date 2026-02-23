@@ -25,7 +25,7 @@ const authLimiter = rateLimit({
   standardHeaders: true, legacyHeaders: false,
 });
 const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, max: 200,
+  windowMs: 15 * 60 * 1000, max: 300,
   message: { error: 'Demasiadas peticiones.' },
   standardHeaders: true, legacyHeaders: false,
 });
@@ -41,6 +41,15 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Token inválido o expirado' });
   req.userId = user.id;
   next();
+}
+
+// Helper: crear notificación solo si el destinatario es distinto al actor
+async function createNotif(userId, fromUserId, type, referenceId) {
+  if (!userId || userId === fromUserId) return;
+  await supabase.from('notifications').insert({
+    user_id: userId, from_user_id: fromUserId,
+    type, reference_id: referenceId,
+  });
 }
 
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'red-social-server' }));
@@ -86,7 +95,6 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     id: authData.user.id, username, birth_date, avatar_url: avatar_url ?? null,
   });
   if (profileError) {
-    console.error('Profile insert error:', profileError);
     await supabase.auth.admin.deleteUser(authData.user.id);
     return res.status(500).json({ error: `Error creando perfil: ${profileError.message}` });
   }
@@ -151,6 +159,53 @@ app.patch('/api/auth/me', requireAuth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
+// PROFILES (para perfil de extraños)
+// ══════════════════════════════════════════════════════════════
+
+app.get('/api/profiles/:username', requireAuth, async (req, res) => {
+  const { username } = req.params;
+  const userId = req.userId;
+
+  const { data: profile, error } = await supabase
+    .from('profiles').select('id, username, avatar_url, birth_date, created_at')
+    .eq('username', username).single();
+  if (error || !profile) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+  // Friendship status
+  const [sentRow, receivedRow] = await Promise.all([
+    supabase.from('friendships').select('id, status')
+      .eq('requester_id', userId).eq('addressee_id', profile.id).maybeSingle(),
+    supabase.from('friendships').select('id, status')
+      .eq('requester_id', profile.id).eq('addressee_id', userId).maybeSingle(),
+  ]);
+
+  let friendStatus = 'none'; // none | pending_sent | pending_received | friends
+  if (sentRow.data?.status === 'accepted' || receivedRow.data?.status === 'accepted')
+    friendStatus = 'friends';
+  else if (sentRow.data?.status === 'pending')
+    friendStatus = 'pending_sent';
+  else if (receivedRow.data?.status === 'pending')
+    friendStatus = 'pending_received';
+
+  // Videos subidos
+  const { data: videos } = await supabase.from('videos')
+    .select('id, cloudinary_url, title, created_at')
+    .eq('uploaded_by', profile.id)
+    .order('created_at', { ascending: false });
+
+  res.json({
+    profile: {
+      id: profile.id, username: profile.username,
+      avatar_url: profile.avatar_url, created_at: profile.created_at,
+    },
+    friend_status: friendStatus,
+    videos: (videos ?? []).map(v => ({
+      id: v.id, url: v.cloudinary_url, title: v.title, created_at: v.created_at,
+    })),
+  });
+});
+
+// ══════════════════════════════════════════════════════════════
 // VIDEOS
 // ══════════════════════════════════════════════════════════════
 
@@ -161,7 +216,7 @@ app.get('/api/videos', requireAuth, async (req, res) => {
 
   const { data: videos, error } = await supabase
     .from('videos')
-    .select('id, cloudinary_url, title, created_at, profiles(username, avatar_url)')
+    .select('id, cloudinary_url, title, created_at, uploaded_by, profiles(username, avatar_url)')
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
   if (error) return res.status(500).json({ error: `Error obteniendo videos: ${error.message}` });
@@ -174,6 +229,7 @@ app.get('/api/videos', requireAuth, async (req, res) => {
     ]);
     return {
       id: v.id, url: v.cloudinary_url, title: v.title,
+      uploaded_by: v.uploaded_by,
       uploader: v.profiles?.username ?? 'Desconocido',
       uploader_avatar: v.profiles?.avatar_url ?? null,
       likes_count: likesResult.count ?? 0,
@@ -192,7 +248,6 @@ app.post('/api/videos', requireAuth, async (req, res) => {
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
   if (!cloudinary_url.startsWith(`https://res.cloudinary.com/${cloudName}/`))
     return res.status(400).json({ error: 'URL de Cloudinary inválida' });
-  // Generar UUID como string (la tabla videos tiene id TEXT PRIMARY KEY)
   const videoId = randomUUID();
   const { data, error } = await supabase.from('videos').insert({
     id: videoId, cloudinary_url, cloudinary_public_id: cloudinary_public_id ?? null,
@@ -219,6 +274,9 @@ app.post('/api/likes/toggle', requireAuth, async (req, res) => {
   } else {
     await supabase.from('likes').insert({ user_id: userId, video_id });
     liked = true;
+    // Notificar al dueño del video
+    const { data: video } = await supabase.from('videos').select('uploaded_by').eq('id', video_id).single();
+    if (video?.uploaded_by) await createNotif(video.uploaded_by, userId, 'like_video', video_id);
   }
   const { count } = await supabase.from('likes').select('id', { count: 'exact', head: true }).eq('video_id', video_id);
   res.json({ liked, likes_count: count ?? 0 });
@@ -249,33 +307,27 @@ app.post('/api/saved/toggle', requireAuth, async (req, res) => {
 // COMENTARIOS
 // ══════════════════════════════════════════════════════════════
 
-// Obtener comentarios principales + sus respuestas, con likes y ocultos
 app.get('/api/comments/:videoId', requireAuth, async (req, res) => {
   const { videoId } = req.params;
   const userId = req.userId;
 
-  // Comentarios principales (sin parent)
   const { data: comments, error } = await supabase.from('comments')
     .select('id, text, created_at, user_id, profiles(username, avatar_url)')
-    .eq('video_id', videoId)
-    .is('parent_id', null)
+    .eq('video_id', videoId).is('parent_id', null)
     .order('created_at', { ascending: true });
   if (error) return res.status(500).json({ error: `Error obteniendo comentarios: ${error.message}` });
 
-  // Ocultos por este usuario
   const { data: hidden } = await supabase.from('hidden_comments')
     .select('comment_id').eq('user_id', userId);
   const hiddenSet = new Set((hidden ?? []).map(h => h.comment_id));
 
-  // Enriquecer con likes y respuestas
   const enriched = await Promise.all(comments.map(async (c) => {
     const [likesRes, userLikedRes, repliesRes] = await Promise.all([
       supabase.from('comment_likes').select('id', { count: 'exact', head: true }).eq('comment_id', c.id),
       supabase.from('comment_likes').select('id').eq('comment_id', c.id).eq('user_id', userId).maybeSingle(),
       supabase.from('comments')
         .select('id, text, created_at, user_id, profiles(username, avatar_url)')
-        .eq('parent_id', c.id)
-        .order('created_at', { ascending: true }),
+        .eq('parent_id', c.id).order('created_at', { ascending: true }),
     ]);
 
     const replies = await Promise.all((repliesRes.data ?? []).map(async (r) => {
@@ -284,34 +336,24 @@ app.get('/api/comments/:videoId', requireAuth, async (req, res) => {
         supabase.from('comment_likes').select('id').eq('comment_id', r.id).eq('user_id', userId).maybeSingle(),
       ]);
       return {
-        id: r.id, text: r.text, created_at: r.created_at,
-        user_id: r.user_id,
-        username: r.profiles?.username ?? 'Usuario',
-        avatar_url: r.profiles?.avatar_url ?? null,
-        likes_count: rLikesRes.count ?? 0,
-        user_liked: !!rUserLikedRes.data,
-        hidden: hiddenSet.has(r.id),
-        is_mine: r.user_id === userId,
+        id: r.id, text: r.text, created_at: r.created_at, user_id: r.user_id,
+        username: r.profiles?.username ?? 'Usuario', avatar_url: r.profiles?.avatar_url ?? null,
+        likes_count: rLikesRes.count ?? 0, user_liked: !!rUserLikedRes.data,
+        hidden: hiddenSet.has(r.id), is_mine: r.user_id === userId,
       };
     }));
 
     return {
-      id: c.id, text: c.text, created_at: c.created_at,
-      user_id: c.user_id,
-      username: c.profiles?.username ?? 'Usuario',
-      avatar_url: c.profiles?.avatar_url ?? null,
-      likes_count: likesRes.count ?? 0,
-      user_liked: !!userLikedRes.data,
-      hidden: hiddenSet.has(c.id),
-      is_mine: c.user_id === userId,
-      replies,
+      id: c.id, text: c.text, created_at: c.created_at, user_id: c.user_id,
+      username: c.profiles?.username ?? 'Usuario', avatar_url: c.profiles?.avatar_url ?? null,
+      likes_count: likesRes.count ?? 0, user_liked: !!userLikedRes.data,
+      hidden: hiddenSet.has(c.id), is_mine: c.user_id === userId, replies,
     };
   }));
 
   res.json({ comments: enriched });
 });
 
-// Nuevo comentario principal
 app.post('/api/comments', requireAuth, async (req, res) => {
   const { video_id, text } = req.body;
   const userId = req.userId;
@@ -323,18 +365,18 @@ app.post('/api/comments', requireAuth, async (req, res) => {
     .select('id, text, created_at, user_id').single();
   if (error) return res.status(500).json({ error: `Error guardando comentario: ${error.message}` });
   const { data: profile } = await supabase.from('profiles').select('username, avatar_url').eq('id', userId).single();
+  // Notificar dueño del video
+  const { data: video } = await supabase.from('videos').select('uploaded_by').eq('id', video_id).single();
+  if (video?.uploaded_by) await createNotif(video.uploaded_by, userId, 'comment_video', data.id);
   res.status(201).json({
     comment: {
-      id: data.id, text: data.text, created_at: data.created_at,
-      user_id: data.user_id,
-      username: profile?.username ?? 'Usuario',
-      avatar_url: profile?.avatar_url ?? null,
+      id: data.id, text: data.text, created_at: data.created_at, user_id: data.user_id,
+      username: profile?.username ?? 'Usuario', avatar_url: profile?.avatar_url ?? null,
       likes_count: 0, user_liked: false, hidden: false, is_mine: true, replies: [],
     },
   });
 });
 
-// Responder a un comentario
 app.post('/api/comments/:parentId/reply', requireAuth, async (req, res) => {
   const { parentId } = req.params;
   const { text, video_id } = req.body;
@@ -347,18 +389,18 @@ app.post('/api/comments/:parentId/reply', requireAuth, async (req, res) => {
     .select('id, text, created_at, user_id').single();
   if (error) return res.status(500).json({ error: `Error guardando respuesta: ${error.message}` });
   const { data: profile } = await supabase.from('profiles').select('username, avatar_url').eq('id', userId).single();
+  // Notificar al dueño del comentario padre
+  const { data: parent } = await supabase.from('comments').select('user_id').eq('id', parentId).single();
+  if (parent?.user_id) await createNotif(parent.user_id, userId, 'reply_comment', data.id);
   res.status(201).json({
     reply: {
-      id: data.id, text: data.text, created_at: data.created_at,
-      user_id: data.user_id,
-      username: profile?.username ?? 'Usuario',
-      avatar_url: profile?.avatar_url ?? null,
+      id: data.id, text: data.text, created_at: data.created_at, user_id: data.user_id,
+      username: profile?.username ?? 'Usuario', avatar_url: profile?.avatar_url ?? null,
       likes_count: 0, user_liked: false, hidden: false, is_mine: true,
     },
   });
 });
 
-// Eliminar comentario propio
 app.delete('/api/comments/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
   const userId = req.userId;
@@ -369,7 +411,6 @@ app.delete('/api/comments/:id', requireAuth, async (req, res) => {
   res.json({ deleted: true });
 });
 
-// Ocultar comentario para mí
 app.post('/api/comments/:id/hide', requireAuth, async (req, res) => {
   const { id } = req.params;
   const userId = req.userId;
@@ -384,16 +425,10 @@ app.post('/api/comments/:id/hide', requireAuth, async (req, res) => {
   }
 });
 
-// Denunciar comentario (por ahora solo log, sin tabla dedicada)
 app.post('/api/comments/:id/report', requireAuth, async (req, res) => {
-  const { id } = req.params;
-  console.log(`Comentario denunciado: ${id} por usuario: ${req.userId}`);
+  console.log(`Comentario denunciado: ${req.params.id} por: ${req.userId}`);
   res.json({ reported: true });
 });
-
-// ══════════════════════════════════════════════════════════════
-// LIKES DE COMENTARIOS
-// ══════════════════════════════════════════════════════════════
 
 app.post('/api/comment-likes/toggle', requireAuth, async (req, res) => {
   const { comment_id } = req.body;
@@ -408,9 +443,206 @@ app.post('/api/comment-likes/toggle', requireAuth, async (req, res) => {
   } else {
     await supabase.from('comment_likes').insert({ user_id: userId, comment_id });
     liked = true;
+    // Notificar al dueño del comentario
+    const { data: comment } = await supabase.from('comments').select('user_id').eq('id', comment_id).single();
+    if (comment?.user_id) await createNotif(comment.user_id, userId, 'like_comment', comment_id);
   }
   const { count } = await supabase.from('comment_likes').select('id', { count: 'exact', head: true }).eq('comment_id', comment_id);
   res.json({ liked, likes_count: count ?? 0 });
+});
+
+// ══════════════════════════════════════════════════════════════
+// NOTIFICACIONES
+// ══════════════════════════════════════════════════════════════
+
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  const userId = req.userId;
+
+  const { data: notifs, error } = await supabase
+    .from('notifications')
+    .select('id, type, reference_id, read, created_at, profiles!notifications_from_user_id_fkey(username, avatar_url)')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: false })
+    .limit(50);
+  if (error) return res.status(500).json({ error: error.message });
+
+  const { count: unread } = await supabase
+    .from('notifications').select('id', { count: 'exact', head: true })
+    .eq('user_id', userId).eq('read', false);
+
+  const mapped = (notifs ?? []).map(n => ({
+    id: n.id, type: n.type, reference_id: n.reference_id,
+    read: n.read, created_at: n.created_at,
+    from_username: n.profiles?.username ?? 'Usuario',
+    from_avatar: n.profiles?.avatar_url ?? null,
+  }));
+
+  res.json({ notifications: mapped, unread_count: unread ?? 0 });
+});
+
+app.post('/api/notifications/read', requireAuth, async (req, res) => {
+  await supabase.from('notifications').update({ read: true })
+    .eq('user_id', req.userId).eq('read', false);
+  res.json({ ok: true });
+});
+
+// ══════════════════════════════════════════════════════════════
+// AMIGOS / SEGUIR
+// ══════════════════════════════════════════════════════════════
+
+app.get('/api/friends', requireAuth, async (req, res) => {
+  const userId = req.userId;
+
+  // Amigos aceptados (en cualquier dirección)
+  const [sent, received] = await Promise.all([
+    supabase.from('friendships')
+      .select('id, status, created_at, addressee_id, profiles!friendships_addressee_id_fkey(username, avatar_url)')
+      .eq('requester_id', userId),
+    supabase.from('friendships')
+      .select('id, status, created_at, requester_id, profiles!friendships_requester_id_fkey(username, avatar_url)')
+      .eq('addressee_id', userId),
+  ]);
+
+  const friends = [];
+  const pending_received = [];
+  const pending_sent = [];
+
+  for (const f of sent.data ?? []) {
+    const p = f.profiles;
+    if (f.status === 'accepted')
+      friends.push({ id: f.addressee_id, username: p?.username, avatar_url: p?.avatar_url, friendship_id: f.id });
+    else
+      pending_sent.push({ id: f.addressee_id, username: p?.username, avatar_url: p?.avatar_url, friendship_id: f.id });
+  }
+  for (const f of received.data ?? []) {
+    const p = f.profiles;
+    if (f.status === 'accepted')
+      friends.push({ id: f.requester_id, username: p?.username, avatar_url: p?.avatar_url, friendship_id: f.id });
+    else
+      pending_received.push({ id: f.requester_id, username: p?.username, avatar_url: p?.avatar_url, friendship_id: f.id });
+  }
+
+  // Mensajes no leídos por amigo
+  const unreadMsgs = await supabase.from('messages')
+    .select('sender_id', { count: 'exact' })
+    .eq('receiver_id', userId).eq('read', false);
+
+  const unreadByUser = {};
+  for (const m of unreadMsgs.data ?? []) {
+    unreadByUser[m.sender_id] = (unreadByUser[m.sender_id] ?? 0) + 1;
+  }
+
+  const enrichedFriends = friends.map(f => ({
+    ...f, unread_messages: unreadByUser[f.id] ?? 0,
+  }));
+
+  res.json({ friends: enrichedFriends, pending_received, pending_sent });
+});
+
+app.post('/api/friends/request', requireAuth, async (req, res) => {
+  const { addressee_username } = req.body;
+  const userId = req.userId;
+  if (!addressee_username) return res.status(400).json({ error: 'addressee_username requerido' });
+
+  const { data: addressee } = await supabase.from('profiles')
+    .select('id').eq('username', addressee_username).single();
+  if (!addressee) return res.status(404).json({ error: 'Usuario no encontrado' });
+  if (addressee.id === userId) return res.status(400).json({ error: 'No puedes seguirte a ti mismo' });
+
+  // Verificar si ya existe
+  const { data: existing } = await supabase.from('friendships').select('id, status')
+    .or(`and(requester_id.eq.${userId},addressee_id.eq.${addressee.id}),and(requester_id.eq.${addressee.id},addressee_id.eq.${userId})`)
+    .maybeSingle();
+  if (existing) {
+    if (existing.status === 'accepted') return res.status(409).json({ error: 'Ya son amigos' });
+    return res.status(409).json({ error: 'Solicitud ya enviada' });
+  }
+
+  await supabase.from('friendships').insert({ requester_id: userId, addressee_id: addressee.id });
+  await createNotif(addressee.id, userId, 'friend_request', userId);
+  res.json({ ok: true, status: 'pending_sent' });
+});
+
+app.post('/api/friends/respond', requireAuth, async (req, res) => {
+  const { friendship_id, accept } = req.body;
+  const userId = req.userId;
+  if (!friendship_id || accept === undefined)
+    return res.status(400).json({ error: 'friendship_id y accept requeridos' });
+
+  const { data: friendship } = await supabase.from('friendships')
+    .select('id, requester_id, addressee_id, status').eq('id', friendship_id).single();
+  if (!friendship) return res.status(404).json({ error: 'Solicitud no encontrada' });
+  if (friendship.addressee_id !== userId) return res.status(403).json({ error: 'No es tu solicitud' });
+  if (friendship.status !== 'pending') return res.status(400).json({ error: 'Solicitud ya procesada' });
+
+  if (accept) {
+    await supabase.from('friendships').update({ status: 'accepted' }).eq('id', friendship_id);
+    await createNotif(friendship.requester_id, userId, 'friend_accepted', userId);
+    res.json({ ok: true, status: 'friends' });
+  } else {
+    await supabase.from('friendships').delete().eq('id', friendship_id);
+    res.json({ ok: true, status: 'rejected' });
+  }
+});
+
+app.delete('/api/friends/:friendId', requireAuth, async (req, res) => {
+  const { friendId } = req.params;
+  const userId = req.userId;
+  await supabase.from('friendships').delete()
+    .or(`and(requester_id.eq.${userId},addressee_id.eq.${friendId}),and(requester_id.eq.${friendId},addressee_id.eq.${userId})`);
+  res.json({ ok: true });
+});
+
+// ══════════════════════════════════════════════════════════════
+// MENSAJES
+// ══════════════════════════════════════════════════════════════
+
+app.get('/api/messages/:userId', requireAuth, async (req, res) => {
+  const { userId: otherId } = req.params;
+  const myId = req.userId;
+
+  // Verificar que son amigos
+  const { data: friendship } = await supabase.from('friendships').select('id, status')
+    .or(`and(requester_id.eq.${myId},addressee_id.eq.${otherId}),and(requester_id.eq.${otherId},addressee_id.eq.${myId})`)
+    .eq('status', 'accepted').maybeSingle();
+  if (!friendship) return res.status(403).json({ error: 'Solo puedes chatear con amigos' });
+
+  const { data: messages, error } = await supabase.from('messages')
+    .select('id, sender_id, receiver_id, text, read, created_at')
+    .or(`and(sender_id.eq.${myId},receiver_id.eq.${otherId}),and(sender_id.eq.${otherId},receiver_id.eq.${myId})`)
+    .order('created_at', { ascending: true })
+    .limit(100);
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Marcar como leídos los mensajes del otro hacia mí
+  await supabase.from('messages').update({ read: true })
+    .eq('sender_id', otherId).eq('receiver_id', myId).eq('read', false);
+
+  res.json({ messages: messages ?? [] });
+});
+
+app.post('/api/messages', requireAuth, async (req, res) => {
+  const { receiver_id, text } = req.body;
+  const senderId = req.userId;
+  if (!receiver_id || !text) return res.status(400).json({ error: 'receiver_id y text requeridos' });
+  if (text.trim().length === 0) return res.status(400).json({ error: 'Mensaje vacío' });
+  if (text.length > 1000) return res.status(400).json({ error: 'Máximo 1000 caracteres' });
+
+  // Verificar amistad
+  const { data: friendship } = await supabase.from('friendships').select('id')
+    .or(`and(requester_id.eq.${senderId},addressee_id.eq.${receiver_id}),and(requester_id.eq.${receiver_id},addressee_id.eq.${senderId})`)
+    .eq('status', 'accepted').maybeSingle();
+  if (!friendship) return res.status(403).json({ error: 'Solo puedes enviar mensajes a amigos' });
+
+  const { data, error } = await supabase.from('messages')
+    .insert({ sender_id: senderId, receiver_id, text: text.trim() })
+    .select('id, sender_id, receiver_id, text, read, created_at').single();
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Notificar al receptor
+  await createNotif(receiver_id, senderId, 'new_message', data.id);
+
+  res.status(201).json({ message: data });
 });
 
 app.listen(PORT, () => console.log(`Servidor en puerto ${PORT}`));
