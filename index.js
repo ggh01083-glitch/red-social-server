@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const { randomUUID } = require('crypto');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -191,7 +192,8 @@ app.post('/api/videos', requireAuth, async (req, res) => {
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
   if (!cloudinary_url.startsWith(`https://res.cloudinary.com/${cloudName}/`))
     return res.status(400).json({ error: 'URL de Cloudinary inválida' });
-  const videoId = cloudinary_public_id?.split('/').pop() ?? `vid_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  // Generar UUID como string (la tabla videos tiene id TEXT PRIMARY KEY)
+  const videoId = randomUUID();
   const { data, error } = await supabase.from('videos').insert({
     id: videoId, cloudinary_url, cloudinary_public_id: cloudinary_public_id ?? null,
     title: title ?? 'Sin título', uploaded_by: userId,
