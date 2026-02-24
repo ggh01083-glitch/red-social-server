@@ -482,26 +482,42 @@ app.post('/api/comment-likes/toggle', requireAuth, async (req, res) => {
 app.get('/api/notifications', requireAuth, async (req, res) => {
   const userId = req.userId;
 
+  // Query simple sin joins complejos
   const { data: notifs, error } = await supabase
     .from('notifications')
-    .select('id, type, reference_id, read, created_at, profiles!notifications_from_user_id_fkey(username, avatar_url)')
+    .select('id, type, reference_id, read, created_at, from_user_id')
     .eq('user_id', userId)
     .order('created_at', { ascending: false })
     .limit(50);
-  if (error) return res.status(500).json({ error: error.message });
+
+  if (error) {
+    console.error('Notifications query error:', error.message);
+    return res.status(500).json({ error: error.message });
+  }
 
   const { count: unread } = await supabase
     .from('notifications').select('id', { count: 'exact', head: true })
     .eq('user_id', userId).eq('read', false);
 
-  // Enriquecer cada notificación con contexto de navegación
-  const enriched = await Promise.all((notifs ?? []).map(async (n) => {
+  if (!notifs || notifs.length === 0) {
+    return res.json({ notifications: [], unread_count: unread ?? 0 });
+  }
+
+  // Obtener perfiles de los "from_user_id" en una sola query
+  const fromUserIds = [...new Set(notifs.map(n => n.from_user_id).filter(Boolean))];
+  const { data: fromProfiles } = await supabase
+    .from('profiles').select('id, username, avatar_url').in('id', fromUserIds);
+  const profileMap = {};
+  for (const p of fromProfiles ?? []) profileMap[p.id] = p;
+
+  // Enriquecer con contexto de navegación (queries separadas, sin joins encadenados)
+  const enriched = await Promise.all(notifs.map(async (n) => {
+    const fromP = profileMap[n.from_user_id] ?? {};
     const base = {
       id: n.id, type: n.type, reference_id: n.reference_id,
       read: n.read, created_at: n.created_at,
-      from_username: n.profiles?.username ?? 'Usuario',
-      from_avatar: n.profiles?.avatar_url ?? null,
-      // campos de navegación (se rellenan según el tipo)
+      from_username: fromP.username ?? 'Usuario',
+      from_avatar: fromP.avatar_url ?? null,
       video_id: null, video_title: null,
       comment_id: null, comment_text: null,
       chat_user_id: null, chat_username: null, chat_avatar: null,
@@ -509,67 +525,80 @@ app.get('/api/notifications', requireAuth, async (req, res) => {
     };
 
     try {
-      switch (n.type) {
-        case 'like_video': {
-          // reference_id = video_id
-          const { data: v } = await supabase.from('videos')
-            .select('id, title, profiles(username)').eq('id', n.reference_id).single();
-          if (v) { base.video_id = v.id; base.video_title = v.title; base.uploader_username = v.profiles?.username; }
-          break;
-        }
-        case 'comment_video': {
-          // reference_id = comment_id → buscar comment.video_id
-          const { data: c } = await supabase.from('comments')
-            .select('id, text, video_id, videos(title, profiles(username))').eq('id', n.reference_id).single();
-          if (c) {
-            base.video_id = c.video_id; base.comment_id = c.id;
-            base.comment_text = c.text?.substring(0, 80);
-            base.video_title = c.videos?.title;
-            base.uploader_username = c.videos?.profiles?.username;
+      if (n.type === 'like_video') {
+        // reference_id = video_id
+        const { data: v } = await supabase.from('videos')
+          .select('id, title, uploaded_by').eq('id', n.reference_id).maybeSingle();
+        if (v) {
+          base.video_id = v.id;
+          base.video_title = v.title;
+          if (v.uploaded_by) {
+            const { data: up } = await supabase.from('profiles')
+              .select('username').eq('id', v.uploaded_by).maybeSingle();
+            base.uploader_username = up?.username ?? null;
           }
-          break;
         }
-        case 'reply_comment': {
-          // reference_id = reply_id → buscar reply.video_id a través del parent
-          const { data: r } = await supabase.from('comments')
-            .select('id, text, video_id, parent_id, videos(title, profiles(username))').eq('id', n.reference_id).single();
-          if (r) {
-            base.video_id = r.video_id; base.comment_id = r.parent_id ?? r.id;
-            base.comment_text = r.text?.substring(0, 80);
-            base.video_title = r.videos?.title;
-            base.uploader_username = r.videos?.profiles?.username;
+
+      } else if (n.type === 'comment_video' || n.type === 'like_comment') {
+        // reference_id = comment_id
+        const { data: c } = await supabase.from('comments')
+          .select('id, text, video_id').eq('id', n.reference_id).maybeSingle();
+        if (c) {
+          base.comment_id = c.id;
+          base.comment_text = (c.text ?? '').substring(0, 80);
+          base.video_id = c.video_id;
+          if (c.video_id) {
+            const { data: v } = await supabase.from('videos')
+              .select('title, uploaded_by').eq('id', c.video_id).maybeSingle();
+            if (v) {
+              base.video_title = v.title;
+              if (v.uploaded_by) {
+                const { data: up } = await supabase.from('profiles')
+                  .select('username').eq('id', v.uploaded_by).maybeSingle();
+                base.uploader_username = up?.username ?? null;
+              }
+            }
           }
-          break;
         }
-        case 'like_comment': {
-          // reference_id = comment_id
-          const { data: c } = await supabase.from('comments')
-            .select('id, text, video_id, videos(title, profiles(username))').eq('id', n.reference_id).single();
-          if (c) {
-            base.video_id = c.video_id; base.comment_id = c.id;
-            base.comment_text = c.text?.substring(0, 80);
-            base.video_title = c.videos?.title;
-            base.uploader_username = c.videos?.profiles?.username;
+
+      } else if (n.type === 'reply_comment') {
+        // reference_id = reply comment_id
+        const { data: r } = await supabase.from('comments')
+          .select('id, text, video_id, parent_id').eq('id', n.reference_id).maybeSingle();
+        if (r) {
+          base.comment_id = r.parent_id ?? r.id;
+          base.comment_text = (r.text ?? '').substring(0, 80);
+          base.video_id = r.video_id;
+          if (r.video_id) {
+            const { data: v } = await supabase.from('videos')
+              .select('title, uploaded_by').eq('id', r.video_id).maybeSingle();
+            if (v) {
+              base.video_title = v.title;
+              if (v.uploaded_by) {
+                const { data: up } = await supabase.from('profiles')
+                  .select('username').eq('id', v.uploaded_by).maybeSingle();
+                base.uploader_username = up?.username ?? null;
+              }
+            }
           }
-          break;
         }
-        case 'new_message': {
-          // reference_id = message_id → buscar sender profile
-          const { data: msg } = await supabase.from('messages')
-            .select('sender_id, profiles!messages_sender_id_fkey(username, avatar_url)').eq('id', n.reference_id).single();
-          if (msg) {
-            base.chat_user_id = msg.sender_id;
-            base.chat_username = msg.profiles?.username;
-            base.chat_avatar = msg.profiles?.avatar_url;
-          }
-          break;
-        }
-        case 'followed_you': {
-          // reference_id = follower user_id → no navegación
-          break;
+
+      } else if (n.type === 'new_message') {
+        // reference_id = message_id
+        const { data: msg } = await supabase.from('messages')
+          .select('id, sender_id').eq('id', n.reference_id).maybeSingle();
+        if (msg?.sender_id) {
+          const { data: sp } = await supabase.from('profiles')
+            .select('username, avatar_url').eq('id', msg.sender_id).maybeSingle();
+          base.chat_user_id = msg.sender_id;
+          base.chat_username = sp?.username ?? null;
+          base.chat_avatar = sp?.avatar_url ?? null;
         }
       }
-    } catch (_) { /* si falla el enrich, se devuelve sin contexto */ }
+      // followed_you: no necesita contexto extra
+    } catch (enrichErr) {
+      console.error('Enrich error for notif', n.id, ':', enrichErr.message);
+    }
 
     return base;
   }));
