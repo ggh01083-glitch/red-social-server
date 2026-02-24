@@ -171,14 +171,16 @@ app.get('/api/profiles/:username', requireAuth, async (req, res) => {
     .eq('username', username).single();
   if (error || !profile) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-  // Follow status (following = yo sigo a él, follower = él me sigue, friends = mutual)
-  const [iFollow, theyFollow] = await Promise.all([
+  // Follow status: solo mira si existe la fila, ignora status column (puede tener valores viejos)
+  const [{ data: iFollowRow }, { data: theyFollowRow }] = await Promise.all([
     supabase.from('friendships').select('id').eq('requester_id', userId).eq('addressee_id', profile.id).maybeSingle(),
     supabase.from('friendships').select('id').eq('requester_id', profile.id).eq('addressee_id', userId).maybeSingle(),
   ]);
-  let friendStatus = 'none'; // none | following | friends
-  if (iFollow.data && theyFollow.data) friendStatus = 'friends';
-  else if (iFollow.data) friendStatus = 'following';
+  // none | following | follower | friends
+  let friendStatus = 'none';
+  if (iFollowRow && theyFollowRow) friendStatus = 'friends';
+  else if (iFollowRow) friendStatus = 'following';
+  else if (theyFollowRow) friendStatus = 'follower'; // me sigue pero yo no
 
   // Videos subidos (busca por uploaded_by O por el username en profiles join)
   const { data: videos } = await supabase.from('videos')
@@ -487,26 +489,25 @@ app.post('/api/notifications/read', requireAuth, async (req, res) => {
 app.get('/api/friends', requireAuth, async (req, res) => {
   const userId = req.userId;
 
-  // Todos a quienes sigo
-  const { data: following } = await supabase.from('friendships')
-    .select('addressee_id, profiles!friendships_addressee_id_fkey(username, avatar_url)')
-    .eq('requester_id', userId);
+  // IDs que yo sigo
+  const { data: followingRows } = await supabase.from('friendships')
+    .select('addressee_id').eq('requester_id', userId);
+  // IDs que me siguen
+  const { data: followerRows } = await supabase.from('friendships')
+    .select('requester_id').eq('addressee_id', userId);
 
-  // Todos los que me siguen a mí
-  const { data: followers } = await supabase.from('friendships')
-    .select('requester_id')
-    .eq('addressee_id', userId);
+  const followingIds = (followingRows ?? []).map(r => r.addressee_id);
+  const followerSet = new Set((followerRows ?? []).map(r => r.requester_id));
 
-  const followerSet = new Set((followers ?? []).map(f => f.requester_id));
+  // Mutuos = yo los sigo Y me siguen
+  const mutualIds = followingIds.filter(id => followerSet.has(id));
 
-  // Amigos = los que sigo Y me siguen (mutual)
-  const friends = (following ?? [])
-    .filter(f => followerSet.has(f.addressee_id))
-    .map(f => ({
-      id: f.addressee_id,
-      username: f.profiles?.username,
-      avatar_url: f.profiles?.avatar_url,
-    }));
+  if (mutualIds.length === 0) return res.json({ friends: [] });
+
+  // Obtener perfiles de los mutuos
+  const { data: profiles } = await supabase.from('profiles')
+    .select('id, username, avatar_url')
+    .in('id', mutualIds);
 
   // Mensajes no leídos
   const { data: unreadMsgs } = await supabase.from('messages')
@@ -516,43 +517,77 @@ app.get('/api/friends', requireAuth, async (req, res) => {
     unreadByUser[m.sender_id] = (unreadByUser[m.sender_id] ?? 0) + 1;
   }
 
-  const enriched = friends.map(f => ({ ...f, unread_messages: unreadByUser[f.id] ?? 0 }));
-  res.json({ friends: enriched });
+  const friends = (profiles ?? []).map(p => ({
+    id: p.id, username: p.username, avatar_url: p.avatar_url,
+    unread_messages: unreadByUser[p.id] ?? 0,
+  }));
+
+  res.json({ friends });
 });
 
-// POST /api/follow → seguir a alguien (inmediato, sin aprobación)
+// POST /api/follow → seguir a alguien
 app.post('/api/follow', requireAuth, async (req, res) => {
   const { username } = req.body;
   const userId = req.userId;
   if (!username) return res.status(400).json({ error: 'username requerido' });
 
-  const { data: target } = await supabase.from('profiles').select('id').eq('username', username).single();
-  if (!target) return res.status(404).json({ error: 'Usuario no encontrado' });
+  const { data: target, error: targetErr } = await supabase.from('profiles')
+    .select('id').eq('username', username).single();
+  if (targetErr || !target) return res.status(404).json({ error: 'Usuario no encontrado' });
   if (target.id === userId) return res.status(400).json({ error: 'No puedes seguirte a ti mismo' });
 
-  // Si ya lo sigo, no hacer nada
+  // Ver si ya existe la fila
   const { data: existing } = await supabase.from('friendships').select('id')
     .eq('requester_id', userId).eq('addressee_id', target.id).maybeSingle();
-  if (existing) return res.json({ ok: true, status: 'following' });
 
-  await supabase.from('friendships').insert({ requester_id: userId, addressee_id: target.id, status: 'following' });
+  if (!existing) {
+    // Intentar insert. Si la tabla tiene columna status con default, no la mandamos.
+    // Si falla por constraint, intentamos con status explícito como fallback.
+    let insertError = null;
+    const attempt1 = await supabase.from('friendships')
+      .insert({ requester_id: userId, addressee_id: target.id });
+    if (attempt1.error) {
+      console.error('Follow insert attempt 1:', attempt1.error.message);
+      const attempt2 = await supabase.from('friendships')
+        .insert({ requester_id: userId, addressee_id: target.id, status: 'accepted' });
+      if (attempt2.error) {
+        console.error('Follow insert attempt 2:', attempt2.error.message);
+        return res.status(500).json({ error: 'Error al seguir: ' + attempt2.error.message });
+      }
+    }
+    await createNotif(target.id, userId, 'followed_you', userId);
+  }
 
-  // Notificar al seguido
-  await createNotif(target.id, userId, 'followed_you', userId);
+  // Verificar resultado real en DB
+  const [{ data: myRow }, { data: theirRow }] = await Promise.all([
+    supabase.from('friendships').select('id').eq('requester_id', userId).eq('addressee_id', target.id).maybeSingle(),
+    supabase.from('friendships').select('id').eq('requester_id', target.id).eq('addressee_id', userId).maybeSingle(),
+  ]);
 
-  // Comprobar si ahora son mutuos (friends)
-  const { data: theyFollow } = await supabase.from('friendships').select('id')
-    .eq('requester_id', target.id).eq('addressee_id', userId).maybeSingle();
-  const isFriend = !!theyFollow;
+  console.log(`Follow: ${userId} -> ${target.id} | myRow: ${!!myRow} | theirRow: ${!!theirRow}`);
 
-  res.json({ ok: true, status: isFriend ? 'friends' : 'following' });
+  if (!myRow) return res.status(500).json({ error: 'Follow no se guardó en DB' });
+
+  res.json({ ok: true, status: (myRow && theirRow) ? 'friends' : 'following' });
 });
 
-// DELETE /api/follow/:userId → dejar de seguir
+// DELETE /api/follow/:targetId → dejar de seguir
 app.delete('/api/follow/:targetId', requireAuth, async (req, res) => {
   const { targetId } = req.params;
   const userId = req.userId;
-  await supabase.from('friendships').delete().eq('requester_id', userId).eq('addressee_id', targetId);
+  const { error } = await supabase.from('friendships')
+    .delete().eq('requester_id', userId).eq('addressee_id', targetId);
+  if (error) {
+    console.error('Unfollow error:', error.message);
+    return res.status(500).json({ error: 'Error al dejar de seguir: ' + error.message });
+  }
+  // Verificar que realmente se borró
+  const { data: stillExists } = await supabase.from('friendships').select('id')
+    .eq('requester_id', userId).eq('addressee_id', targetId).maybeSingle();
+  if (stillExists) {
+    console.error('Unfollow: row still exists after delete!');
+  }
+  console.log(`Unfollow: ${userId} -> ${targetId} | stillExists: ${!!stillExists}`);
   res.json({ ok: true, status: 'none' });
 });
 
