@@ -671,4 +671,35 @@ app.post('/api/messages', requireAuth, async (req, res) => {
   res.status(201).json({ message: data });
 });
 
+// POST /api/messages/nudge → mensaje predeterminado sin requerir follow mutuo (máx 3 veces)
+app.post('/api/messages/nudge', requireAuth, async (req, res) => {
+  const { receiver_id } = req.body;
+  const senderId = req.userId;
+  if (!receiver_id) return res.status(400).json({ error: 'receiver_id requerido' });
+  if (receiver_id === senderId) return res.status(400).json({ error: 'No puedes enviarte un nudge a ti mismo' });
+
+  const NUDGE_TEXT = 'Sígueme para poder enviarte un mensaje, debo decirte algo';
+  const MAX_NUDGES = 3;
+
+  // Contar cuántos nudges ya mandé a este usuario
+  const { count } = await supabase.from('messages')
+    .select('id', { count: 'exact', head: true })
+    .eq('sender_id', senderId)
+    .eq('receiver_id', receiver_id)
+    .eq('text', NUDGE_TEXT);
+
+  if ((count ?? 0) >= MAX_NUDGES) {
+    return res.status(429).json({ error: 'Ya enviaste el máximo de mensajes de este tipo (3)', nudge_count: count });
+  }
+
+  const { data, error } = await supabase.from('messages')
+    .insert({ sender_id: senderId, receiver_id, text: NUDGE_TEXT })
+    .select('id, sender_id, receiver_id, text, read, created_at').single();
+  if (error) return res.status(500).json({ error: error.message });
+
+  await createNotif(receiver_id, senderId, 'new_message', data.id);
+
+  res.status(201).json({ message: data, nudge_count: (count ?? 0) + 1, nudges_left: MAX_NUDGES - (count ?? 0) - 1 });
+});
+
 app.listen(PORT, () => console.log(`Servidor en puerto ${PORT}`));
