@@ -252,6 +252,35 @@ app.post('/api/videos', requireAuth, async (req, res) => {
   res.status(201).json({ video: { ...data, likes_count: 0, user_liked: false, user_saved: false } });
 });
 
+// GET /api/videos/:id → un video específico (para abrir desde notificaciones)
+app.get('/api/videos/:videoId', requireAuth, async (req, res) => {
+  const { videoId } = req.params;
+  const userId = req.userId;
+
+  const { data: v, error } = await supabase
+    .from('videos')
+    .select('id, cloudinary_url, title, created_at, uploaded_by, profiles(username, avatar_url)')
+    .eq('id', videoId).single();
+  if (error || !v) return res.status(404).json({ error: 'Video no encontrado' });
+
+  const [likesRes, userLikedRes, savedRes] = await Promise.all([
+    supabase.from('likes').select('id', { count: 'exact', head: true }).eq('video_id', videoId),
+    supabase.from('likes').select('id').eq('video_id', videoId).eq('user_id', userId).maybeSingle(),
+    supabase.from('saved_videos').select('id').eq('video_id', videoId).eq('user_id', userId).maybeSingle(),
+  ]);
+
+  res.json({ video: {
+    id: v.id, url: v.cloudinary_url, title: v.title,
+    uploaded_by: v.uploaded_by,
+    uploader: v.profiles?.username ?? 'Desconocido',
+    uploader_avatar: v.profiles?.avatar_url ?? null,
+    likes_count: likesRes.count ?? 0,
+    user_liked: !!userLikedRes.data,
+    user_saved: !!savedRes.data,
+    created_at: v.created_at,
+  }});
+});
+
 // ══════════════════════════════════════════════════════════════
 // LIKES DE VIDEOS
 // ══════════════════════════════════════════════════════════════
@@ -465,14 +494,87 @@ app.get('/api/notifications', requireAuth, async (req, res) => {
     .from('notifications').select('id', { count: 'exact', head: true })
     .eq('user_id', userId).eq('read', false);
 
-  const mapped = (notifs ?? []).map(n => ({
-    id: n.id, type: n.type, reference_id: n.reference_id,
-    read: n.read, created_at: n.created_at,
-    from_username: n.profiles?.username ?? 'Usuario',
-    from_avatar: n.profiles?.avatar_url ?? null,
+  // Enriquecer cada notificación con contexto de navegación
+  const enriched = await Promise.all((notifs ?? []).map(async (n) => {
+    const base = {
+      id: n.id, type: n.type, reference_id: n.reference_id,
+      read: n.read, created_at: n.created_at,
+      from_username: n.profiles?.username ?? 'Usuario',
+      from_avatar: n.profiles?.avatar_url ?? null,
+      // campos de navegación (se rellenan según el tipo)
+      video_id: null, video_title: null,
+      comment_id: null, comment_text: null,
+      chat_user_id: null, chat_username: null, chat_avatar: null,
+      uploader_username: null,
+    };
+
+    try {
+      switch (n.type) {
+        case 'like_video': {
+          // reference_id = video_id
+          const { data: v } = await supabase.from('videos')
+            .select('id, title, profiles(username)').eq('id', n.reference_id).single();
+          if (v) { base.video_id = v.id; base.video_title = v.title; base.uploader_username = v.profiles?.username; }
+          break;
+        }
+        case 'comment_video': {
+          // reference_id = comment_id → buscar comment.video_id
+          const { data: c } = await supabase.from('comments')
+            .select('id, text, video_id, videos(title, profiles(username))').eq('id', n.reference_id).single();
+          if (c) {
+            base.video_id = c.video_id; base.comment_id = c.id;
+            base.comment_text = c.text?.substring(0, 80);
+            base.video_title = c.videos?.title;
+            base.uploader_username = c.videos?.profiles?.username;
+          }
+          break;
+        }
+        case 'reply_comment': {
+          // reference_id = reply_id → buscar reply.video_id a través del parent
+          const { data: r } = await supabase.from('comments')
+            .select('id, text, video_id, parent_id, videos(title, profiles(username))').eq('id', n.reference_id).single();
+          if (r) {
+            base.video_id = r.video_id; base.comment_id = r.parent_id ?? r.id;
+            base.comment_text = r.text?.substring(0, 80);
+            base.video_title = r.videos?.title;
+            base.uploader_username = r.videos?.profiles?.username;
+          }
+          break;
+        }
+        case 'like_comment': {
+          // reference_id = comment_id
+          const { data: c } = await supabase.from('comments')
+            .select('id, text, video_id, videos(title, profiles(username))').eq('id', n.reference_id).single();
+          if (c) {
+            base.video_id = c.video_id; base.comment_id = c.id;
+            base.comment_text = c.text?.substring(0, 80);
+            base.video_title = c.videos?.title;
+            base.uploader_username = c.videos?.profiles?.username;
+          }
+          break;
+        }
+        case 'new_message': {
+          // reference_id = message_id → buscar sender profile
+          const { data: msg } = await supabase.from('messages')
+            .select('sender_id, profiles!messages_sender_id_fkey(username, avatar_url)').eq('id', n.reference_id).single();
+          if (msg) {
+            base.chat_user_id = msg.sender_id;
+            base.chat_username = msg.profiles?.username;
+            base.chat_avatar = msg.profiles?.avatar_url;
+          }
+          break;
+        }
+        case 'followed_you': {
+          // reference_id = follower user_id → no navegación
+          break;
+        }
+      }
+    } catch (_) { /* si falla el enrich, se devuelve sin contexto */ }
+
+    return base;
   }));
 
-  res.json({ notifications: mapped, unread_count: unread ?? 0 });
+  res.json({ notifications: enriched, unread_count: unread ?? 0 });
 });
 
 app.post('/api/notifications/read', requireAuth, async (req, res) => {
