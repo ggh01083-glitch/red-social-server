@@ -485,29 +485,40 @@ app.post('/api/notifications/read', requireAuth, async (req, res) => {
 // AMIGOS / SEGUIR
 // ══════════════════════════════════════════════════════════════
 
-// GET /api/friends → amigos mutuos (ambos se siguen)
+// GET /api/friends → mutuos + gente con historial de mensajes (aunque ya no se sigan)
 app.get('/api/friends', requireAuth, async (req, res) => {
   const userId = req.userId;
 
-  // IDs que yo sigo
-  const { data: followingRows } = await supabase.from('friendships')
-    .select('addressee_id').eq('requester_id', userId);
-  // IDs que me siguen
-  const { data: followerRows } = await supabase.from('friendships')
-    .select('requester_id').eq('addressee_id', userId);
+  // Follows en ambas direcciones
+  const [{ data: followingRows }, { data: followerRows }] = await Promise.all([
+    supabase.from('friendships').select('addressee_id').eq('requester_id', userId),
+    supabase.from('friendships').select('requester_id').eq('addressee_id', userId),
+  ]);
 
-  const followingIds = (followingRows ?? []).map(r => r.addressee_id);
-  const followerSet = new Set((followerRows ?? []).map(r => r.requester_id));
+  const followingSet = new Set((followingRows ?? []).map(r => r.addressee_id));
+  const followerSet  = new Set((followerRows  ?? []).map(r => r.requester_id));
 
-  // Mutuos = yo los sigo Y me siguen
-  const mutualIds = followingIds.filter(id => followerSet.has(id));
+  // Mutuos
+  const mutualIds = [...followingSet].filter(id => followerSet.has(id));
 
-  if (mutualIds.length === 0) return res.json({ friends: [] });
+  // Personas con las que hay historial de mensajes (aunque ya no se sigan)
+  const [{ data: sentMsgs }, { data: recvMsgs }] = await Promise.all([
+    supabase.from('messages').select('receiver_id').eq('sender_id', userId),
+    supabase.from('messages').select('sender_id').eq('receiver_id', userId),
+  ]);
+  const chatPartners = new Set([
+    ...(sentMsgs ?? []).map(m => m.receiver_id),
+    ...(recvMsgs ?? []).map(m => m.sender_id),
+  ]);
 
-  // Obtener perfiles de los mutuos
+  // Unión: mutuos + historial (sin duplicados, sin el propio userId)
+  const allIds = [...new Set([...mutualIds, ...chatPartners])].filter(id => id !== userId);
+
+  if (allIds.length === 0) return res.json({ friends: [] });
+
+  // Obtener perfiles
   const { data: profiles } = await supabase.from('profiles')
-    .select('id, username, avatar_url')
-    .in('id', mutualIds);
+    .select('id, username, avatar_url').in('id', allIds);
 
   // Mensajes no leídos
   const { data: unreadMsgs } = await supabase.from('messages')
@@ -517,10 +528,19 @@ app.get('/api/friends', requireAuth, async (req, res) => {
     unreadByUser[m.sender_id] = (unreadByUser[m.sender_id] ?? 0) + 1;
   }
 
-  const friends = (profiles ?? []).map(p => ({
-    id: p.id, username: p.username, avatar_url: p.avatar_url,
-    unread_messages: unreadByUser[p.id] ?? 0,
-  }));
+  const friends = (profiles ?? []).map(p => {
+    const iFollow   = followingSet.has(p.id);
+    const theyFollow = followerSet.has(p.id);
+    let followStatus = 'none';
+    if (iFollow && theyFollow) followStatus = 'friends';
+    else if (iFollow)          followStatus = 'following';
+    else if (theyFollow)       followStatus = 'follower';
+    return {
+      id: p.id, username: p.username, avatar_url: p.avatar_url,
+      follow_status: followStatus,
+      unread_messages: unreadByUser[p.id] ?? 0,
+    };
+  });
 
   res.json({ friends });
 });
@@ -599,14 +619,16 @@ app.get('/api/messages/:userId', requireAuth, async (req, res) => {
   const { userId: otherId } = req.params;
   const myId = req.userId;
 
-  // Verificar que son amigos
-  // Solo pueden chatear si el follow es mutuo
-  const [{ data: iFollow }, { data: theyFollow }] = await Promise.all([
+  // Obtener follow status en ambas direcciones
+  const [{ data: iFollowRow }, { data: theyFollowRow }] = await Promise.all([
     supabase.from('friendships').select('id').eq('requester_id', myId).eq('addressee_id', otherId).maybeSingle(),
     supabase.from('friendships').select('id').eq('requester_id', otherId).eq('addressee_id', myId).maybeSingle(),
   ]);
-  if (!iFollow || !theyFollow) return res.status(403).json({ error: 'Solo puedes chatear con amigos mutuos' });
+  const iFollow    = !!iFollowRow;
+  const theyFollow = !!theyFollowRow;
+  const canSend    = iFollow && theyFollow;
 
+  // Obtener historial (aunque no puedan enviar, pueden ver el historial)
   const { data: messages, error } = await supabase.from('messages')
     .select('id, sender_id, receiver_id, text, read, created_at')
     .in('sender_id', [myId, otherId])
@@ -615,11 +637,13 @@ app.get('/api/messages/:userId', requireAuth, async (req, res) => {
     .limit(100);
   if (error) return res.status(500).json({ error: error.message });
 
-  // Marcar como leídos los mensajes del otro hacia mí
-  await supabase.from('messages').update({ read: true })
-    .eq('sender_id', otherId).eq('receiver_id', myId).eq('read', false);
+  // Solo marcar como leídos si pueden chatear
+  if (canSend) {
+    await supabase.from('messages').update({ read: true })
+      .eq('sender_id', otherId).eq('receiver_id', myId).eq('read', false);
+  }
 
-  res.json({ messages: messages ?? [] });
+  res.json({ messages: messages ?? [], can_send: canSend, i_follow: iFollow, they_follow: theyFollow });
 });
 
 app.post('/api/messages', requireAuth, async (req, res) => {
@@ -634,7 +658,7 @@ app.post('/api/messages', requireAuth, async (req, res) => {
     supabase.from('friendships').select('id').eq('requester_id', senderId).eq('addressee_id', receiver_id).maybeSingle(),
     supabase.from('friendships').select('id').eq('requester_id', receiver_id).eq('addressee_id', senderId).maybeSingle(),
   ]);
-  if (!sf1 || !sf2) return res.status(403).json({ error: 'Solo puedes enviar mensajes a amigos mutuos' });
+  if (!sf1 || !sf2) return res.status(403).json({ error: 'Error al mandar mensaje (ambas personas deben seguirse)' });
 
   const { data, error } = await supabase.from('messages')
     .insert({ sender_id: senderId, receiver_id, text: text.trim() })
